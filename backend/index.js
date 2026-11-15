@@ -109,7 +109,7 @@ app.post('/api/stress', (req, res) => {
     const { Worker } = require('worker_threads');
     const workers = [];
     let finished = 0;
-    const numWorkers = Math.max(os.cpus().length, 2);
+    const numWorkers = 2;
     for (let i = 0; i < numWorkers; i++) {
       const w = new Worker(workerCode, { eval: true, workerData: { duration } });
       w.on('message', () => { finished++; if (finished >= numWorkers) resetState(); });
@@ -118,7 +118,7 @@ app.post('/api/stress', (req, res) => {
     }
   } else if (type === 'memory') {
     const chunks = [];
-    const totalMB = 450;
+    const totalMB = 300;
     const chunkSize = 10 * 1024 * 1024;
     for (let i = 0; i < totalMB / 10; i++) {
       chunks.push(Buffer.alloc(chunkSize, 0xff));
