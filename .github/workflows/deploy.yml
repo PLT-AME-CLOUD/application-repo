@@ -1,5 +1,6 @@
-# Builds Docker images for frontend and backend, pushes them to ECR,
-# and triggers an ECS service update to deploy the new containers.
+# CD pipeline: deploys CI-built images to ECS using immutable commit-SHA tags.
+# Checks CI status on the commit, waits for manual approval, then deploys.
+# No images are rebuilt or re-tagged.
 
 name: Deploy Application
 
@@ -8,51 +9,175 @@ on:
     branches:
       - main
 
-# Prevent overlapping deploys from racing on ECS service updates
 concurrency:
   group: app-deploy
   cancel-in-progress: false
 
-# OIDC token for AWS authentication, read access for checkout
 permissions:
   id-token: write
   contents: read
+  statuses: write
 
 jobs:
-  deploy-app:
+  # ── Job 1: Verify CI passed on this commit ───────────────────────────
+  verify-ci:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Check app directories
-        run: |
-          ls -l frontend/Dockerfile || echo "Error: Frontend Dockerfile not found"
-          ls -l backend/Dockerfile || echo "Error: Backend Dockerfile not found"
-          if [ ! -f frontend/Dockerfile ] || [ ! -f backend/Dockerfile ]; then exit 1; fi
+      - name: Set commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Authenticate to AWS using GitHub OIDC — no long-lived credentials stored
+      - name: Status — verify started
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const ctx of ['cd/verify-ci', 'cd/approval', 'cd/deploy-ecs']) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+                state: 'pending', context: ctx, description: 'Waiting to start'
+              });
+            }
+
+      - name: Check CI statuses on commit
+        id: verify
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requiredContexts = ['ci/frontend-build', 'ci/backend-build', 'ci/image-scan'];
+            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha
+            });
+
+            const statuses = {};
+            for (const s of combined.statuses) {
+              statuses[s.context] = s.state;
+            }
+
+            const failed = [];
+            const missing = [];
+            for (const ctx of requiredContexts) {
+              if (!statuses[ctx]) missing.push(ctx);
+              else if (statuses[ctx] !== 'success') failed.push(`${ctx}: ${statuses[ctx]}`);
+            }
+
+            if (missing.length > 0 || failed.length > 0) {
+              const msg = [
+                missing.length ? `Missing: ${missing.join(', ')}` : '',
+                failed.length ? `Failed: ${failed.join(', ')}` : ''
+              ].filter(Boolean).join('. ');
+              core.setFailed(`CI checks not satisfied. ${msg}`);
+            } else {
+              core.info('All CI checks passed');
+            }
+
+      - name: Status — verify result
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+              state: '${{ steps.verify.outcome }}' === 'success' ? 'success' : 'failure',
+              context: 'cd/verify-ci',
+              description: '${{ steps.verify.outcome }}' === 'success'
+                ? 'CI passed for ${{ steps.vars.outputs.sha_short }}'
+                : 'CI checks not satisfied — run CI first',
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
+
+  # ── Job 2: Wait for manual approval ──────────────────────────────────
+  approve:
+    needs: verify-ci
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Status — approved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+              state: 'success', context: 'cd/approval',
+              description: 'Deployment approved',
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
+
+  # ── Job 3: Deploy CI-built images to ECS ─────────────────────────────
+  deploy:
+    needs: approve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set commit SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Status — deploy started
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+              state: 'pending', context: 'cd/deploy-ecs', description: 'Deploying...'
+            });
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
-      - name: Log in to ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push frontend image
+      - name: Deploy frontend to ECS
+        id: deploy-frontend
         run: |
-          docker build --provenance=false -t ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest frontend/
-          docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition frontend-task --query 'taskDefinition' --output json)
+          REGISTRY=$(echo "$TASK_DEF" | jq -r '.containerDefinitions[0].image' | cut -d: -f1)
+          NEW_IMAGE="${REGISTRY}:frontend-${{ github.sha }}"
 
-      - name: Build and push backend image
-        run: |
-          docker build --provenance=false -t ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest backend/
-          docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMG "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
-      - name: Update ECS services
+          NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered frontend task: $NEW_ARN"
+
+          aws ecs update-service --cluster ecs-cluster --service frontend-service --task-definition "$NEW_ARN" --desired-count 1 --force-new-deployment
+
+      - name: Deploy backend to ECS
+        id: deploy-backend
         run: |
-          aws ecs update-service --cluster ecs-cluster --service frontend-service --desired-count 1 --force-new-deployment
-          aws ecs update-service --cluster ecs-cluster --service backend-service --desired-count 1 --force-new-deployment
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition backend-task --query 'taskDefinition' --output json)
+          REGISTRY=$(echo "$TASK_DEF" | jq -r '.containerDefinitions[0].image' | cut -d: -f1)
+          NEW_IMAGE="${REGISTRY}:backend-${{ github.sha }}"
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMG "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered backend task: $NEW_ARN"
+
+          aws ecs update-service --cluster ecs-cluster --service backend-service --task-definition "$NEW_ARN" --desired-count 1 --force-new-deployment
+
+      - name: Status — deploy result
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fe = '${{ steps.deploy-frontend.outcome }}';
+            const be = '${{ steps.deploy-backend.outcome }}';
+            const success = fe === 'success' && be === 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+              state: success ? 'success' : 'failure',
+              context: 'cd/deploy-ecs',
+              description: success
+                ? 'Deployed ${{ steps.vars.outputs.sha_short }} to ecs-cluster'
+                : `Deploy failed (frontend: ${fe}, backend: ${be})`,
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
