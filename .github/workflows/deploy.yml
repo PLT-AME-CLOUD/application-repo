@@ -44,12 +44,12 @@ jobs:
 
       - name: Build and push frontend image
         run: |
-          docker build -t ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest frontend/
+          docker build --provenance=false -t ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest frontend/
           docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest
 
       - name: Build and push backend image
         run: |
-          docker build -t ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest backend/
+          docker build --provenance=false -t ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest backend/
           docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest
 
       - name: Update ECS services

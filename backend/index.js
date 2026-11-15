@@ -78,6 +78,71 @@ app.post('/api/text', (req, res) => {
   res.json({ original: text, action, result });
 });
 
+let stressState = { active: false, type: null, startedAt: null, endsAt: null };
+
+app.post('/api/stress', (req, res) => {
+  const { type, durationSeconds } = req.body;
+  const duration = Math.min(Math.max(parseInt(durationSeconds) || 30, 5), 300);
+
+  if (stressState.active) {
+    return res.status(409).json({ error: 'Stress test already running.', ...stressState });
+  }
+
+  stressState = {
+    active: true,
+    type,
+    startedAt: new Date().toISOString(),
+    endsAt: new Date(Date.now() + duration * 1000).toISOString()
+  };
+
+  if (type === 'cpu') {
+    const end = Date.now() + duration * 1000;
+    function burn() {
+      const batchEnd = Date.now() + 100;
+      while (Date.now() < batchEnd) { Math.sqrt(Math.random() * 999999); }
+      if (Date.now() < end) { setImmediate(burn); }
+      else { stressState = { active: false, type: null, startedAt: null, endsAt: null }; }
+    }
+    burn();
+  } else if (type === 'memory') {
+    const chunks = [];
+    const totalMB = 400;
+    const chunkSize = 10 * 1024 * 1024;
+    for (let i = 0; i < totalMB / 10; i++) {
+      chunks.push(Buffer.alloc(chunkSize, 0));
+    }
+    setTimeout(() => {
+      chunks.length = 0;
+      if (global.gc) global.gc();
+      stressState = { active: false, type: null, startedAt: null, endsAt: null };
+    }, duration * 1000);
+  } else {
+    stressState = { active: false, type: null, startedAt: null, endsAt: null };
+    return res.status(400).json({ error: 'Type must be "cpu" or "memory".' });
+  }
+
+  res.json({
+    message: `${type} stress test started for ${duration}s`,
+    hostname: os.hostname(),
+    ...stressState
+  });
+});
+
+app.get('/api/stress/status', (req, res) => {
+  const mem = process.memoryUsage();
+  res.json({
+    stress: stressState,
+    hostname: os.hostname(),
+    cpuUsage: process.cpuUsage(),
+    memoryMB: {
+      rss: Math.round(mem.rss / 1024 / 1024),
+      heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
+      heapTotal: Math.round(mem.heapTotal / 1024 / 1024)
+    },
+    uptime: Math.floor(process.uptime())
+  });
+});
+
 app.get('/api/info', (req, res) => {
   res.json({
     hostname: os.hostname(),

@@ -78,6 +78,46 @@
       <div id="text-result" class="result hidden"></div>
     </section>
 
+    <!-- Load Test Card -->
+    <section class="card stress-card">
+      <h2>Auto-Scaling Load Test</h2>
+      <p class="card-desc">Generate CPU or memory load on the backend to trigger ECS auto-scaling. Scaling policies fire at 80% utilization.</p>
+      <div class="form-row">
+        <select id="stress-type" class="input">
+          <option value="cpu">CPU Stress</option>
+          <option value="memory">Memory Stress (400 MB)</option>
+        </select>
+        <select id="stress-duration" class="input">
+          <option value="30">30 seconds</option>
+          <option value="60">60 seconds</option>
+          <option value="120" selected>2 minutes</option>
+          <option value="180">3 minutes</option>
+          <option value="300">5 minutes</option>
+        </select>
+        <button onclick="startStress()" class="btn btn-danger" id="stress-btn">Start Load Test</button>
+      </div>
+      <div id="stress-result" class="result hidden"></div>
+      <div id="stress-monitor" class="hidden">
+        <div class="monitor-header">
+          <span class="monitor-title">Live Resource Monitor</span>
+          <span id="monitor-indicator" class="pulse"></span>
+        </div>
+        <div class="meter-group">
+          <div class="meter-box">
+            <div class="meter-label">Memory (RSS)</div>
+            <div class="meter-bar"><div class="meter-fill" id="meter-mem"></div></div>
+            <div class="meter-value" id="meter-mem-text">0 MB</div>
+          </div>
+          <div class="meter-box">
+            <div class="meter-label">Heap Used</div>
+            <div class="meter-bar"><div class="meter-fill meter-fill-alt" id="meter-heap"></div></div>
+            <div class="meter-value" id="meter-heap-text">0 MB</div>
+          </div>
+        </div>
+        <div class="monitor-meta" id="monitor-meta"></div>
+      </div>
+    </section>
+
     <!-- Server Info Card -->
     <section class="card">
       <h2>Server Info</h2>
