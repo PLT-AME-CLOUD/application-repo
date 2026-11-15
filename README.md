@@ -109,7 +109,7 @@ The frontend includes a live resource monitor that polls every 2s during a test,
 ## Infrastructure
 
 This application depends on the ECS infrastructure from the companion repository:
-[ecsworkshop-infra](https://github.com/PLT-AME-CLOUD/platform_infra_aws)
+[platform_infra_aws](https://github.com/PLT-AME-CLOUD/platform_infra_aws)
 
 That repo provisions via Terraform:
 - VPC, subnets, security groups, and VPC endpoints (ECR, S3, CloudWatch Logs)
