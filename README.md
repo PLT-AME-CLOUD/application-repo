@@ -4,11 +4,13 @@ A containerized full-stack web application deployed on AWS ECS Fargate with CI/C
 
 ## SPARK — Security Principles
 
-> **S — Security** : GitHub OIDC federated authentication; no passwords, no keys in pipelines
-> **P — Protection** : Zero long-lived credentials; short-lived tokens with least-privilege IAM roles
-> **A — Availability** : Multi-AZ deployment across private subnets with auto-scaling and health checks
-> **R — Recovery** : 100% Infrastructure-as-Code (Terraform) — tear down and recreate in minutes
-> **K — Knowledge** : CloudWatch Logs for application telemetry, CloudTrail for API audit trail
+| | Principle | What it means |
+|:-:|---|---|
+| **S** | **Security** | GitHub OIDC federated authentication — no passwords, no keys in pipelines |
+| **P** | **Protection** | Zero long-lived credentials; short-lived tokens with least-privilege IAM roles |
+| **A** | **Availability** | Multi-AZ deployment across private subnets with auto-scaling and health checks |
+| **R** | **Recovery** | 100% Infrastructure-as-Code (Terraform) — tear down and recreate in minutes |
+| **K** | **Knowledge** | CloudWatch Logs for application telemetry, CloudTrail for API audit trail |
 
 ## Why ECS Fargate — Cost Optimization
 
