@@ -1,63 +1,58 @@
-# Workflow: Builds, packages, and deploys app to AWS ECS
+# Builds Docker images for frontend and backend, pushes them to ECR,
+# and triggers an ECS service update to deploy the new containers.
+
 name: Deploy Application
 
-# Trigger: Runs on any push to main branch
 on:
   push:
     branches:
       - main
 
+# Prevent overlapping deploys from racing on ECS service updates
+concurrency:
+  group: app-deploy
+  cancel-in-progress: false
+
+# OIDC token for AWS authentication, read access for checkout
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   deploy-app:
-    # Runner: Ubuntu for Docker compatibility
-    runs-on: ubuntu-latest 
+    runs-on: ubuntu-latest
     steps:
-      # Checkout code from repository
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # Verify Dockerfiles exist
       - name: Check app directories
         run: |
           ls -l frontend/Dockerfile || echo "Error: Frontend Dockerfile not found"
           ls -l backend/Dockerfile || echo "Error: Backend Dockerfile not found"
           if [ ! -f frontend/Dockerfile ] || [ ! -f backend/Dockerfile ]; then exit 1; fi
 
-      # Configure AWS credentials for ECR and ECS access
+      # Authenticate to AWS using GitHub OIDC — no long-lived credentials stored
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
-      # Log in to Amazon ECR
       - name: Log in to ECR
-        run: |
-          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # Package frontend image
-      - name: Package frontend image
+      - name: Build and push frontend image
         run: |
-          docker build -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/my-app-repo:frontend-latest frontend
-          docker images | grep my-app-repo | grep frontend-latest # Verify image
-          echo "Frontend image packaged"
+          docker build -t ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest frontend/
+          docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:frontend-latest
 
-      # Package backend image
-      - name: Package backend image
+      - name: Build and push backend image
         run: |
-          docker build -t ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/my-app-repo:backend-latest backend
-          docker images | grep my-app-repo | grep backend-latest # Verify image
-          echo "Backend image packaged"
+          docker build -t ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest backend/
+          docker push ${{ steps.ecr-login.outputs.registry }}/app-repo:backend-latest
 
-      # Push images to ECR
-      - name: Push images to ECR
-        run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/my-app-repo:frontend-latest
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/my-app-repo:backend-latest
-
-      # Update ECS services to run one task each
       - name: Update ECS services
         run: |
-          aws ecs update-service --cluster my-ecs-cluster --service frontend-service --desired-count 1 --region us-east-1
-          aws ecs update-service --cluster my-ecs-cluster --service backend-service --desired-count 1 --region us-east-1
+          aws ecs update-service --cluster ecs-cluster --service frontend-service --desired-count 1 --force-new-deployment
+          aws ecs update-service --cluster ecs-cluster --service backend-service --desired-count 1 --force-new-deployment

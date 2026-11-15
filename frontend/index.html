@@ -1,18 +1,97 @@
-<!-- Simple HTML frontend for ECS Workshop -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ECS Workshop</title>
-    <link rel="stylesheet" href="style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ECS Workshop</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="container">
-        <h1>Welcome to ECS Workshop with Himanshu!</h1>
-        <p>Frontend running on AWS ECS</p>
-        <p>Backend Status: <span id="backend-status">Checking...</span></p>
+
+  <nav class="navbar">
+    <div class="nav-brand">ECS Workshop</div>
+    <div class="nav-status">
+      Backend: <span id="backend-status" class="status-dot"></span>
     </div>
-    <script src="script.js"></script>
+  </nav>
+
+  <header class="hero">
+    <h1>Welcome to ECS Workshop</h1>
+    <p>A full-stack application running on AWS ECS Fargate</p>
+  </header>
+
+  <main class="container">
+
+    <!-- Greeting Card -->
+    <section class="card">
+      <h2>Greeting Generator</h2>
+      <p class="card-desc">Enter your name and pick a language to get a personalized greeting from the backend.</p>
+      <div class="form-row">
+        <input type="text" id="greet-name" placeholder="Your name" class="input">
+        <select id="greet-lang" class="input">
+          <option value="english">English</option>
+          <option value="spanish">Spanish</option>
+          <option value="french">French</option>
+          <option value="german">German</option>
+          <option value="japanese">Japanese</option>
+          <option value="hindi">Hindi</option>
+        </select>
+        <button onclick="sendGreeting()" class="btn">Greet Me</button>
+      </div>
+      <div id="greet-result" class="result hidden"></div>
+    </section>
+
+    <!-- Calculator Card -->
+    <section class="card">
+      <h2>Calculator</h2>
+      <p class="card-desc">Perform calculations powered by the backend API.</p>
+      <div class="form-row">
+        <input type="number" id="calc-a" placeholder="Number A" class="input">
+        <select id="calc-op" class="input">
+          <option value="add">+</option>
+          <option value="subtract">−</option>
+          <option value="multiply">×</option>
+          <option value="divide">÷</option>
+        </select>
+        <input type="number" id="calc-b" placeholder="Number B" class="input">
+        <button onclick="sendCalc()" class="btn">Calculate</button>
+      </div>
+      <div id="calc-result" class="result hidden"></div>
+    </section>
+
+    <!-- Text Tools Card -->
+    <section class="card">
+      <h2>Text Tools</h2>
+      <p class="card-desc">Transform text using backend-powered utilities.</p>
+      <textarea id="text-input" class="input textarea" placeholder="Type or paste text here..."></textarea>
+      <div class="form-row">
+        <select id="text-action" class="input">
+          <option value="uppercase">UPPERCASE</option>
+          <option value="lowercase">lowercase</option>
+          <option value="titlecase">Title Case</option>
+          <option value="reverse">Reverse</option>
+          <option value="wordcount">Word Count</option>
+          <option value="charcount">Character Count</option>
+        </select>
+        <button onclick="sendText()" class="btn">Transform</button>
+      </div>
+      <div id="text-result" class="result hidden"></div>
+    </section>
+
+    <!-- Server Info Card -->
+    <section class="card">
+      <h2>Server Info</h2>
+      <p class="card-desc">Live information from the backend container.</p>
+      <button onclick="fetchInfo()" class="btn">Fetch Server Info</button>
+      <div id="info-result" class="result hidden"></div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>Running on AWS ECS Fargate &middot; Frontend served by Nginx &middot; Backend powered by Node.js</p>
+  </footer>
+
+  <script src="script.js"></script>
 </body>
 </html>
