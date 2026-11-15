@@ -1,6 +1,11 @@
-# CD pipeline: deploys CI-built images to ECS using immutable commit-SHA tags.
-# Checks CI status on the commit, waits for manual approval, then deploys.
-# No images are rebuilt or re-tagged.
+# ============================================================================
+# CD Pipeline — Deploy CI-built images to ECS
+# ============================================================================
+# Triggers on push to main. Does NOT rebuild or re-tag images.
+# Uses the immutable commit-SHA tags that CI pushed to ECR.
+#
+# Flow: Verify CI statuses → Manual approval (production environment) → Deploy
+# ============================================================================
 
 name: Deploy Application
 
@@ -9,28 +14,46 @@ on:
     branches:
       - main
 
+# Only one deploy at a time — don't cancel in-progress deploys
 concurrency:
   group: app-deploy
   cancel-in-progress: false
 
+# Environment variables shared across jobs
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: ecs-cluster
+
+# Permissions needed for OIDC auth, reading code, and writing commit statuses
 permissions:
   id-token: write
   contents: read
   statuses: write
 
 jobs:
-  # ── Job 1: Verify CI passed on this commit ───────────────────────────
+  # ============================================================================
+  # Job 1: Verify that CI passed on this commit
+  # ============================================================================
+  # Checks the commit statuses set by the CI reusable workflow.
+  # If any required CI check is missing or failed, the deploy is blocked.
+  # Required statuses: ci/frontend-build, ci/backend-build, ci/trivy-scan
+  # ============================================================================
   verify-ci:
     runs-on: ubuntu-latest
     steps:
+
+      # ── Step 1: Checkout code to access the commit SHA ───────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── Step 2: Capture short SHA for human-readable status messages ─
       - name: Set commit SHA
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Status — verify started
+      # ── Step 3: Mark all CD statuses as pending so reviewers can
+      #    see the deployment pipeline has started ──────────────────────
+      - name: Status — mark all CD checks as pending
         uses: actions/github-script@v7
         with:
           script: |
@@ -41,23 +64,29 @@ jobs:
               });
             }
 
+      # ── Step 4: Query the GitHub commit status API and verify all
+      #    required CI contexts passed. These match what ci-reusable.yml
+      #    sets: ci/frontend-build, ci/backend-build, ci/trivy-scan ─────
       - name: Check CI statuses on commit
         id: verify
         uses: actions/github-script@v7
         with:
           script: |
-            const requiredContexts = ['ci/frontend-build', 'ci/backend-build', 'ci/image-scan'];
+            // These must match the status contexts set by ci-reusable.yml
+            const requiredContexts = ['ci/frontend-build', 'ci/backend-build', 'ci/trivy-scan'];
             const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref: context.sha
             });
 
+            // Build a map of context → state from the latest statuses
             const statuses = {};
             for (const s of combined.statuses) {
               statuses[s.context] = s.state;
             }
 
+            // Check each required context is present and succeeded
             const failed = [];
             const missing = [];
             for (const ctx of requiredContexts) {
@@ -75,7 +104,8 @@ jobs:
               core.info('All CI checks passed');
             }
 
-      - name: Status — verify result
+      # ── Step 5: Report whether CI verification passed or failed ──────
+      - name: Status — report verification result
         if: always()
         uses: actions/github-script@v7
         with:
@@ -90,13 +120,21 @@ jobs:
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
             });
 
-  # ── Job 2: Wait for manual approval ──────────────────────────────────
+  # ============================================================================
+  # Job 2: Wait for manual approval
+  # ============================================================================
+  # Uses the "production" GitHub Environment which must have required reviewers
+  # configured in repo Settings > Environments. The pipeline pauses here until
+  # an authorized reviewer approves the deployment.
+  # ============================================================================
   approve:
     needs: verify-ci
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - name: Status — approved
+
+      # ── Step 1: Mark the approval status as success once approved ─────
+      - name: Status — deployment approved
         uses: actions/github-script@v7
         with:
           script: |
@@ -107,18 +145,31 @@ jobs:
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
             });
 
-  # ── Job 3: Deploy CI-built images to ECS ─────────────────────────────
+  # ============================================================================
+  # Job 3: Deploy CI-built images to ECS
+  # ============================================================================
+  # For each service (frontend, backend):
+  #   1. Fetch the current task definition from ECS
+  #   2. Replace the image tag with the commit-SHA tag from CI
+  #   3. Register a new task definition revision
+  #   4. Update the ECS service to use the new revision
+  # No images are rebuilt — we use the exact images CI built and scanned.
+  # ============================================================================
   deploy:
     needs: approve
     runs-on: ubuntu-latest
     steps:
+
+      # ── Step 1: Checkout code to access the commit SHA ───────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── Step 2: Capture short SHA for status messages ────────────────
       - name: Set commit SHA
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
+      # ── Step 3: Mark deploy status as in-progress ────────────────────
       - name: Status — deploy started
         uses: actions/github-script@v7
         with:
@@ -128,43 +179,77 @@ jobs:
               state: 'pending', context: 'cd/deploy-ecs', description: 'Deploying...'
             });
 
-      - name: Configure AWS credentials
+      # ── Step 4: Authenticate to AWS using GitHub OIDC ────────────────
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
+      # ── Step 5: Deploy frontend — fetch current task definition,
+      #    swap the image to the CI-built commit-SHA tag, register a
+      #    new task definition revision, and update the ECS service ──────
       - name: Deploy frontend to ECS
         id: deploy-frontend
         run: |
-          TASK_DEF=$(aws ecs describe-task-definition --task-definition frontend-task --query 'taskDefinition' --output json)
+          # Fetch the current task definition (strip read-only fields for re-registration)
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition frontend-task \
+            --query 'taskDefinition' --output json)
+
+          # Extract the ECR registry/repo prefix and build the new image URI
           REGISTRY=$(echo "$TASK_DEF" | jq -r '.containerDefinitions[0].image' | cut -d: -f1)
           NEW_IMAGE="${REGISTRY}:frontend-${{ github.sha }}"
 
+          # Create a new task definition with the updated image
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMG "$NEW_IMAGE" \
             '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+          # Register the new revision and update the service
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Registered frontend task: $NEW_ARN"
 
-          aws ecs update-service --cluster ecs-cluster --service frontend-service --task-definition "$NEW_ARN" --desired-count 1 --force-new-deployment
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service frontend-service \
+            --task-definition "$NEW_ARN" \
+            --desired-count 1 \
+            --force-new-deployment
 
+      # ── Step 6: Deploy backend — same pattern as frontend ────────────
       - name: Deploy backend to ECS
         id: deploy-backend
         run: |
-          TASK_DEF=$(aws ecs describe-task-definition --task-definition backend-task --query 'taskDefinition' --output json)
+          # Fetch the current task definition
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition backend-task \
+            --query 'taskDefinition' --output json)
+
+          # Extract registry prefix and build new image URI
           REGISTRY=$(echo "$TASK_DEF" | jq -r '.containerDefinitions[0].image' | cut -d: -f1)
           NEW_IMAGE="${REGISTRY}:backend-${{ github.sha }}"
 
+          # Create new task definition with updated image
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq --arg IMG "$NEW_IMAGE" \
             '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
 
-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" --query 'taskDefinition.taskDefinitionArn' --output text)
+          # Register the new revision and update the service
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Registered backend task: $NEW_ARN"
 
-          aws ecs update-service --cluster ecs-cluster --service backend-service --task-definition "$NEW_ARN" --desired-count 1 --force-new-deployment
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service backend-service \
+            --task-definition "$NEW_ARN" \
+            --desired-count 1 \
+            --force-new-deployment
 
-      - name: Status — deploy result
+      # ── Step 7: Report final deploy result as a commit status ────────
+      - name: Status — report deploy result
         if: always()
         uses: actions/github-script@v7
         with:
@@ -177,7 +262,7 @@ jobs:
               state: success ? 'success' : 'failure',
               context: 'cd/deploy-ecs',
               description: success
-                ? 'Deployed ${{ steps.vars.outputs.sha_short }} to ecs-cluster'
+                ? 'Deployed ${{ steps.vars.outputs.sha_short }} to ${{ env.ECS_CLUSTER }}'
                 : `Deploy failed (frontend: ${fe}, backend: ${be})`,
               target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
             });

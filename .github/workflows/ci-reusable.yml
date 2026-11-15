@@ -1,0 +1,271 @@
+# ============================================================================
+# Reusable CI Workflow (Platform-Owned)
+# ============================================================================
+# This workflow is owned by the platform team. Application teams call it from
+# their own ci.yml and pass required parameters. They can extend the caller
+# with extra jobs but cannot modify the build/scan logic or runners here.
+#
+# Flow: Checkout → Build images locally → Scan with Trivy → Push to ECR
+# (images are scanned BEFORE push — vulnerable images never reach the registry)
+# ============================================================================
+
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      ecr_repository:
+        description: "ECR repository name (e.g. app-repo)"
+        required: true
+        type: string
+      aws_region:
+        description: "AWS region for ECR"
+        required: true
+        type: string
+      services:
+        description: 'JSON array of services to build, e.g. [{"name":"frontend","path":"frontend/"},{"name":"backend","path":"backend/"}]'
+        required: true
+        type: string
+      trivy_severity:
+        description: "Trivy severity levels to flag (default: CRITICAL,HIGH)"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+    secrets:
+      AWS_ROLE_ARN:
+        description: "IAM role ARN for GitHub OIDC"
+        required: true
+
+# Permissions needed for OIDC auth, reading code, and writing commit statuses
+permissions:
+  id-token: write
+  contents: read
+  statuses: write
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ── Step 1: Checkout the application source code ─────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Capture short SHA for human-readable status messages ─
+      - name: Set commit metadata
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ── Step 3: Mark all commit statuses as pending so reviewers
+      #    can see the pipeline has started on this commit ──────────────
+      - name: Status — mark all checks as pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const services = JSON.parse('${{ inputs.services }}');
+            // One status per service build + one for the Trivy scan
+            const contexts = services.map(s => `ci/${s.name}-build`);
+            contexts.push('ci/trivy-scan');
+            for (const ctx of contexts) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+                state: 'pending', context: ctx, description: 'Waiting to start'
+              });
+            }
+
+      # ── Step 4: Authenticate to AWS using GitHub OIDC
+      #    (no static credentials — trust policy validates the token) ───
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # ── Step 5: Log in to ECR so we can push images later ────────────
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Step 6: Build Docker images locally for each service.
+      #    Images are tagged with the commit SHA for immutability.
+      #    --provenance=false produces V2 manifests (ECR compatible).
+      #    Images are NOT pushed yet — they stay local for scanning. ─────
+      - name: Build images locally
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPO: ${{ inputs.ecr_repository }}
+          SERVICES: ${{ inputs.services }}
+        run: |
+          FAILED=""
+          BUILT_IMAGES=""
+
+          for row in $(echo "$SERVICES" | jq -c '.[]'); do
+            NAME=$(echo "$row" | jq -r '.name')
+            PATH_DIR=$(echo "$row" | jq -r '.path')
+            TAG="${NAME}-${{ github.sha }}"
+            FULL_IMAGE="${REGISTRY}/${ECR_REPO}:${TAG}"
+
+            echo "::group::Building ${NAME}"
+            if docker build --provenance=false -t "$FULL_IMAGE" "$PATH_DIR"; then
+              echo "Built: ${FULL_IMAGE}"
+              BUILT_IMAGES="${BUILT_IMAGES}${FULL_IMAGE}\n"
+            else
+              echo "::error::Build failed for ${NAME}"
+              FAILED="${FAILED}${NAME},"
+            fi
+            echo "::endgroup::"
+          done
+
+          # Save the list of successfully built images for the scan step
+          printf "%b" "$BUILT_IMAGES" > /tmp/built_images.txt
+          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+
+      # ── Step 7: Report build results as commit statuses ──────────────
+      - name: Status — report build results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const services = JSON.parse('${{ inputs.services }}');
+            const failed = '${{ steps.build.outputs.failed }}'.split(',').filter(Boolean);
+            for (const s of services) {
+              const ok = !failed.includes(s.name);
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+                state: ok ? 'success' : 'failure',
+                context: `ci/${s.name}-build`,
+                description: ok
+                  ? `Image: ${s.name}-${{ steps.vars.outputs.sha_short }}`
+                  : `Build failed`,
+                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+              });
+            }
+
+      # ── Step 8: Install Trivy vulnerability scanner.
+      #    Only runs if all builds succeeded (no point scanning nothing). ─
+      - name: Install Trivy
+        if: steps.build.outputs.failed == ''
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb \
+            $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      # ── Step 9: Scan each locally-built image with Trivy BEFORE pushing.
+      #    Checks for CRITICAL and HIGH severity vulnerabilities.
+      #    If found: pipeline still passes, but emits a warning with a
+      #    7-day remediation deadline. After that deadline, the image
+      #    would be blocked to stop compromised workloads from deploying. ─
+      - name: Scan images with Trivy (before push)
+        id: trivy-scan
+        if: steps.build.outputs.failed == ''
+        env:
+          SEVERITY: ${{ inputs.trivy_severity }}
+        run: |
+          has_critical_or_high="false"
+          scan_summary=""
+          DEADLINE=$(date -d "+7 days" +%Y-%m-%d)
+
+          while IFS= read -r IMAGE; do
+            [ -z "$IMAGE" ] && continue
+            TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
+            echo "::group::Scanning ${TAG}"
+
+            # Run Trivy against the local Docker image (not from a registry)
+            RESULT_FILE="/tmp/trivy-${TAG}.json"
+            trivy image --severity "$SEVERITY" --format json \
+              --output "$RESULT_FILE" "$IMAGE" 2>/dev/null || true
+
+            # Parse vulnerability counts from the JSON report
+            CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$RESULT_FILE")
+            HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$RESULT_FILE")
+
+            line="${TAG} — Critical: ${CRITICAL_COUNT}, High: ${HIGH_COUNT}"
+            echo "$line"
+            scan_summary="${scan_summary}${line}\n"
+
+            # Warn but do not fail — teams get 7 days to remediate
+            if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+              has_critical_or_high="true"
+              echo "::warning::${TAG} has ${CRITICAL_COUNT} critical and ${HIGH_COUNT} high vulnerabilities. Fix by ${DEADLINE} — after that the image will be blocked to stop compromised workloads from deploying."
+            fi
+
+            echo "::endgroup::"
+          done < /tmp/built_images.txt
+
+          echo "has_critical_or_high=$has_critical_or_high" >> "$GITHUB_OUTPUT"
+
+          # Write a summary table to the GitHub Actions job summary page
+          if [ "$has_critical_or_high" = "true" ]; then
+            printf "## Trivy Scan Results\n\n\`\`\`\n%b\`\`\`\n\n> **Warning:** Critical/High vulnerabilities detected. Fix by **%s** — after that the image will be blocked to stop compromised workloads from deploying.\n" \
+              "$scan_summary" "$DEADLINE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf "## Trivy Scan Results\n\n\`\`\`\n%b\`\`\`\n\nNo critical or high vulnerabilities found.\n" \
+              "$scan_summary" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ── Step 10: Push scanned images to ECR.
+      #    Only runs after a successful Trivy scan. Images that were
+      #    built and scanned locally are now pushed to the registry. ──────
+      - name: Push images to ECR
+        id: push
+        if: steps.trivy-scan.outcome == 'success'
+        run: |
+          PUSH_FAILED=""
+
+          while IFS= read -r IMAGE; do
+            [ -z "$IMAGE" ] && continue
+            TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
+            echo "::group::Pushing ${TAG}"
+
+            if docker push "$IMAGE"; then
+              echo "Pushed: ${IMAGE}"
+            else
+              echo "::error::Push failed for ${TAG}"
+              PUSH_FAILED="${PUSH_FAILED}${TAG},"
+            fi
+
+            echo "::endgroup::"
+          done < /tmp/built_images.txt
+
+          if [ -n "$PUSH_FAILED" ]; then
+            echo "::error::Some images failed to push: ${PUSH_FAILED}"
+            exit 1
+          fi
+
+      # ── Step 11: Report Trivy scan result as a commit status ─────────
+      - name: Status — report Trivy scan result
+        if: always() && steps.trivy-scan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hasCritical = '${{ steps.trivy-scan.outputs.has_critical_or_high }}' === 'true';
+            const scanOutcome = '${{ steps.trivy-scan.outcome }}';
+            const pushOutcome = '${{ steps.push.outcome }}';
+            let state = 'success';
+            let description;
+
+            if (scanOutcome !== 'success') {
+              // Trivy itself failed to run
+              state = 'failure';
+              description = 'Trivy scan step failed';
+            } else if (pushOutcome === 'failure') {
+              // Scan passed but push failed
+              state = 'failure';
+              description = 'Scan passed but ECR push failed';
+            } else if (hasCritical) {
+              // Vulnerabilities found — warn but pass
+              description = 'Passed — critical/high vulnerabilities found, 7-day fix window';
+            } else {
+              // Clean scan
+              description = 'No critical or high vulnerabilities';
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
+              state, context: 'ci/trivy-scan', description,
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
