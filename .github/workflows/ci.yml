@@ -1,6 +1,6 @@
-# CI pipeline: builds images tagged with commit SHA, pushes to ECR,
-# waits for vulnerability scans, and reports status against the commit.
-# Runs on feature branches only.
+# CI caller — thin wrapper that app teams own.
+# All build/scan logic lives in ci-reusable.yml (platform-owned).
+# App teams can only change the parameters below.
 
 name: CI Pipeline
 
@@ -19,163 +19,11 @@ permissions:
   statuses: write
 
 jobs:
-  build-and-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set commit SHA
-        id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-
-      # ── Report: CI started ───────────────────────────────────────────
-      - name: Status — CI started
-        uses: actions/github-script@v7
-        with:
-          script: |
-            for (const ctx of ['ci/frontend-build', 'ci/backend-build', 'ci/image-scan']) {
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: context.sha,
-                state: 'pending',
-                context: ctx,
-                description: 'Waiting to start'
-              });
-            }
-
-      # ── AWS and ECR login ────────────────────────────────────────────
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-
-      - name: Log in to ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # ── Build and push frontend ──────────────────────────────────────
-      - name: Build and push frontend image
-        id: frontend-build
-        env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          TAG: frontend-${{ github.sha }}
-        run: |
-          docker build --provenance=false -t $REGISTRY/app-repo:$TAG frontend/
-          docker push $REGISTRY/app-repo:$TAG
-
-      - name: Status — frontend build
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
-              state: '${{ steps.frontend-build.outcome }}' === 'success' ? 'success' : 'failure',
-              context: 'ci/frontend-build',
-              description: 'Image: frontend-${{ steps.vars.outputs.sha_short }}',
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-            });
-
-      # ── Build and push backend ───────────────────────────────────────
-      - name: Build and push backend image
-        id: backend-build
-        env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          TAG: backend-${{ github.sha }}
-        run: |
-          docker build --provenance=false -t $REGISTRY/app-repo:$TAG backend/
-          docker push $REGISTRY/app-repo:$TAG
-
-      - name: Status — backend build
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
-              state: '${{ steps.backend-build.outcome }}' === 'success' ? 'success' : 'failure',
-              context: 'ci/backend-build',
-              description: 'Image: backend-${{ steps.vars.outputs.sha_short }}',
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-            });
-
-      # ── Wait for ECR scans and report ────────────────────────────────
-      - name: Wait for image scans
-        id: scan
-        if: steps.frontend-build.outcome == 'success' && steps.backend-build.outcome == 'success'
-        run: |
-          scan_results=""
-          has_critical_or_high="false"
-
-          for IMAGE_TAG in "frontend-${{ github.sha }}" "backend-${{ github.sha }}"; do
-            echo "::group::Waiting for scan: $IMAGE_TAG"
-
-            for i in $(seq 1 30); do
-              STATUS=$(aws ecr describe-image-scan-findings \
-                --repository-name app-repo \
-                --image-id imageTag="$IMAGE_TAG" \
-                --query 'imageScanStatus.status' \
-                --output text 2>/dev/null || echo "NOT_FOUND")
-
-              if [ "$STATUS" = "COMPLETE" ] || [ "$STATUS" = "FAILED" ]; then break; fi
-              echo "Scan status: $STATUS — waiting (attempt $i/30)..."
-              sleep 10
-            done
-
-            if [ "$STATUS" = "COMPLETE" ]; then
-              FINDINGS=$(aws ecr describe-image-scan-findings \
-                --repository-name app-repo \
-                --image-id imageTag="$IMAGE_TAG" \
-                --query 'imageScanFindings.findingSeverityCounts' \
-                --output json 2>/dev/null || echo "{}")
-
-              CRITICAL=$(echo "$FINDINGS" | jq -r '.CRITICAL // 0')
-              HIGH=$(echo "$FINDINGS" | jq -r '.HIGH // 0')
-              MEDIUM=$(echo "$FINDINGS" | jq -r '.MEDIUM // 0')
-              LOW=$(echo "$FINDINGS" | jq -r '.LOW // 0')
-
-              line="$IMAGE_TAG — Critical: $CRITICAL, High: $HIGH, Medium: $MEDIUM, Low: $LOW"
-              echo "$line"
-              scan_results="${scan_results}${line}\n"
-
-              if [ "$CRITICAL" != "0" ] || [ "$HIGH" != "0" ]; then
-                has_critical_or_high="true"
-                echo "::warning::$IMAGE_TAG has $CRITICAL critical and $HIGH high vulnerabilities"
-              fi
-            else
-              scan_results="${scan_results}${IMAGE_TAG} — Scan did not complete (status: $STATUS)\n"
-            fi
-
-            echo "::endgroup::"
-          done
-
-          echo "has_critical_or_high=$has_critical_or_high" >> "$GITHUB_OUTPUT"
-          printf "## ECR Scan Results\n\n\`\`\`\n%b\n\`\`\`\n" "$scan_results" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Status — image scan
-        if: always() && steps.scan.outcome != 'skipped'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const hasCritical = '${{ steps.scan.outputs.has_critical_or_high }}' === 'true';
-            const scanOutcome = '${{ steps.scan.outcome }}';
-            let state = 'success';
-            let description;
-
-            if (scanOutcome !== 'success') {
-              state = 'failure';
-              description = 'Scan step failed';
-            } else if (hasCritical) {
-              description = 'Passed — critical/high vulnerabilities found, review recommended';
-            } else {
-              description = 'No critical or high vulnerabilities';
-            }
-
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo, sha: context.sha,
-              state, context: 'ci/image-scan', description,
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-            });
+  ci:
+    uses: ./.github/workflows/ci-reusable.yml
+    with:
+      ecr_repository: app-repo
+      aws_region: us-east-1
+      services: '[{"name":"frontend","path":"frontend/"},{"name":"backend","path":"backend/"}]'
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

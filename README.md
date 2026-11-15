@@ -4,14 +4,7 @@ A containerized full-stack web application deployed on AWS ECS Fargate with CI/C
 
 ## Why ECS Fargate — Cost Optimization
 
-| | ECS Fargate | EKS | EC2-backed ECS |
-|---|---|---|---|
-| **Control plane cost** | Free | ~$73/month per cluster | Free |
-| **Compute pricing** | Per-task, per-second billing | EC2 instances always running | EC2 instances always running |
-| **Idle cost** | Zero — tasks scale to 0 when unused | Worker nodes run 24/7 even when idle | Instances run 24/7 even when idle |
-| **Ops overhead** | No servers to patch, no AMIs to manage | Managed control plane, but worker nodes need patching and capacity planning | Full EC2 lifecycle — patching, scaling groups, instance types |
-| **Right-sizing** | Set exact CPU/memory per task (0.25 vCPU / 512 MB here) | Must pick EC2 instance types, bin-pack across nodes | Same as EKS |
-| **Scaling** | Auto-scales individual tasks in seconds | Must scale both pods and underlying nodes (two layers) | Must scale both tasks and ASG instances |
+![AWS](./images/AWS_Cost_Optimization.png)
 
 **Cost breakdown for this application:**
 - Each Fargate task (0.25 vCPU, 512 MB) costs ~$0.012/hour in us-east-1
@@ -52,21 +45,24 @@ application-repo/
 │   └── .dockerignore
 └── .github/
     └── workflows/
-        ├── ci.yml              # CI: build, push, scan (feature branches)
+        ├── ci-reusable.yml     # Reusable CI: build, push, Trivy scan (platform-owned)
+        ├── ci.yml              # CI caller: passes parameters to reusable workflow
         └── deploy.yml          # CD: verify CI, approve, deploy (main)
 ```
 
 ## CI/CD Pipelines
 
-### CI Pipeline (`ci.yml`) — Feature branches only
+### CI Pipeline (`ci.yml` → `ci-reusable.yml`) — Feature branches only
+
+The CI pipeline uses a **reusable workflow** (`ci-reusable.yml`) owned by the platform team. Application teams own the caller (`ci.yml`) that passes parameters and can add extra jobs before or after the reusable workflow — but cannot modify the build/scan logic or runners inside it.
 
 | Step | Commit Status | Description |
 |------|---------------|-------------|
 | Build frontend | `ci/frontend-build` | Builds and pushes image tagged `frontend-<commit-sha>` to ECR |
 | Build backend | `ci/backend-build` | Builds and pushes image tagged `backend-<commit-sha>` to ECR |
-| Vulnerability scan | `ci/image-scan` | Waits for ECR Basic scan results; passes even with critical/high findings (logs warnings) |
+| Trivy scan | `ci/trivy-scan` | Scans images with Trivy for CRITICAL/HIGH vulnerabilities; warns with a 7-day remediation window but does not block |
 
-Images are tagged with the full commit SHA for immutability — no `:latest` tags in CI.
+Images are tagged with the full commit SHA for immutability — no `:latest` tags in CI. Trivy replaces ECR Basic scanning for faster, more detailed results.
 
 ### CD Pipeline (`deploy.yml`) — Main branch only
 
