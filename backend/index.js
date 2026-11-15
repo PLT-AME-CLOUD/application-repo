@@ -95,26 +95,38 @@ app.post('/api/stress', (req, res) => {
     endsAt: new Date(Date.now() + duration * 1000).toISOString()
   };
 
+  const resetState = () => { stressState = { active: false, type: null, startedAt: null, endsAt: null }; };
+
   if (type === 'cpu') {
-    const end = Date.now() + duration * 1000;
-    function burn() {
-      const batchEnd = Date.now() + 100;
-      while (Date.now() < batchEnd) { Math.sqrt(Math.random() * 999999); }
-      if (Date.now() < end) { setImmediate(burn); }
-      else { stressState = { active: false, type: null, startedAt: null, endsAt: null }; }
+    const workerCode = `
+      const { parentPort, workerData } = require('worker_threads');
+      const end = Date.now() + workerData.duration * 1000;
+      while (Date.now() < end) {
+        for (let i = 0; i < 1e6; i++) { Math.sqrt(Math.random() * 999999); }
+      }
+      parentPort.postMessage('done');
+    `;
+    const { Worker } = require('worker_threads');
+    const workers = [];
+    let finished = 0;
+    const numWorkers = Math.max(os.cpus().length, 2);
+    for (let i = 0; i < numWorkers; i++) {
+      const w = new Worker(workerCode, { eval: true, workerData: { duration } });
+      w.on('message', () => { finished++; if (finished >= numWorkers) resetState(); });
+      w.on('error', () => { finished++; if (finished >= numWorkers) resetState(); });
+      workers.push(w);
     }
-    burn();
   } else if (type === 'memory') {
     const chunks = [];
-    const totalMB = 400;
+    const totalMB = 450;
     const chunkSize = 10 * 1024 * 1024;
     for (let i = 0; i < totalMB / 10; i++) {
-      chunks.push(Buffer.alloc(chunkSize, 0));
+      chunks.push(Buffer.alloc(chunkSize, 0xff));
     }
     setTimeout(() => {
       chunks.length = 0;
       if (global.gc) global.gc();
-      stressState = { active: false, type: null, startedAt: null, endsAt: null };
+      resetState();
     }, duration * 1000);
   } else {
     stressState = { active: false, type: null, startedAt: null, endsAt: null };
